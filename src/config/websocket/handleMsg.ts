@@ -21,18 +21,23 @@ import {
   WEBM_DIR,
 } from '@/constant';
 import authController from '@/controller/auth.controller';
+import deskUserController from '@/controller/deskUser.controller';
 import liveController from '@/controller/live.controller';
 import liveRoomController from '@/controller/liveRoom.controller';
 import redisController from '@/controller/redis.controller';
 import userLiveRoomController from '@/controller/userLiveRoom.controller';
 import wsMessageController from '@/controller/wsMessage.controller';
 import { initUser } from '@/init/initUser';
-import { WsMessageMsgIsVerifyEnum } from '@/interface';
+import { IRedisVal, WsMessageMsgIsVerifyEnum } from '@/interface';
 import liveService from '@/service/live.service';
 import liveRoomService from '@/service/liveRoom.service';
 import { LiveRoomMsgVerifyEnum, LiveRoomTypeEnum } from '@/types/ILiveRoom';
 import {
   WsBatchSendOffer,
+  WsBilldDeskJoinedType,
+  WsBilldDeskJoinType,
+  WsBilldDeskStartRemote,
+  WsBilldDeskStartRemoteResult,
   WsDisableSpeakingType,
   WsGetLiveUserType,
   WsGetRoomAllUserType,
@@ -47,7 +52,6 @@ import {
   WsRoomLivingType,
   WsRoomNoLiveType,
   WsStartLiveType,
-  WsStartRemoteDesk,
   WsUpdateJoinInfoType,
 } from '@/types/websocket';
 import { strSlice } from '@/utils';
@@ -65,30 +69,6 @@ export async function handleWsJoin(args: {
   const redisRoomId = roomId;
   if (!roomId) {
     console.log(chalkERROR('roomId为空'));
-    return;
-  }
-  if (data.data.isRemoteDesk) {
-    socket.join(`${roomId}`);
-    console.log(chalkWARN(`${socket.id}进入房间号:${roomId}`));
-    const roomsMap = io.of('/').adapter.rooms;
-    const socketList = roomsMap.get(`${data.data.live_room_id}`);
-    const val = await redisController.getVal({
-      prefix: REDIS_PREFIX.deskUserUuid,
-      key: `${data.data.remoteDeskUserUuid!}`,
-    });
-    let receiver = '';
-    try {
-      receiver = JSON.parse(val!).value.socket_id!;
-    } catch (error) {
-      console.log(error);
-    }
-    socketEmit<WsJoinedType['data']>({
-      socket,
-      msgType: WsMsgTypeEnum.joined,
-      data: {
-        live_room_id: roomId,
-      },
-    });
     return;
   }
   const [liveRoomInfo, liveInfo] = await Promise.all([
@@ -183,63 +163,10 @@ export function handleWsBatchSendOffer(args: {
   });
 }
 
-export async function handleWsStartRemoteDesk(args: {
+export async function handleWsBilldDeskUpdateUser(args: {
   io: Server;
   socket: Socket;
-  data: WsStartRemoteDesk;
-}) {
-  const { socket, data } = args;
-  if (data.data.deskUserUuid) {
-    const val = await redisController.getVal({
-      prefix: REDIS_PREFIX.deskUserUuid,
-      key: `${data.data.remoteDeskUserUuid!}`,
-    });
-    let receiver = '';
-    try {
-      receiver = JSON.parse(val!).value.socket_id!;
-    } catch (error) {
-      console.log(error);
-    }
-    await redisController.setExVal({
-      prefix: REDIS_PREFIX.deskUserUuid,
-      exp: 10,
-      value: {
-        receiver,
-        socket_id: socket.id,
-        deskUserUuid: data.data.deskUserUuid,
-        deskUserPassword: data.data.deskUserPassword,
-        remoteDeskUserUuid: data.data.remoteDeskUserUuid,
-      },
-      key: `${data.data.deskUserUuid}`,
-      client_ip: getSocketRealIp(socket),
-    });
-    await redisController.setExVal({
-      prefix: REDIS_PREFIX.deskUserSocketid,
-      exp: 10,
-      value: {
-        receiver,
-        socket_id: socket.id,
-        deskUserUuid: data.data.deskUserUuid,
-        deskUserPassword: data.data.deskUserPassword,
-        remoteDeskUserUuid: data.data.remoteDeskUserUuid,
-      },
-      key: socket.id,
-      client_ip: getSocketRealIp(socket),
-    });
-  }
-  socketEmit({
-    // @ts-ignore
-    roomId: data.data.roomId,
-    socket,
-    msgType: WsMsgTypeEnum.startRemoteDesk,
-    data,
-  });
-}
-
-export async function handleWsUpdateDeskUser(args: {
-  io: Server;
-  socket: Socket;
-  data: WsStartRemoteDesk;
+  data: WsBilldDeskStartRemote;
 }) {
   try {
     const { socket, data } = args;
@@ -251,19 +178,16 @@ export async function handleWsUpdateDeskUser(args: {
           socket_id: socket.id,
           deskUserUuid: data.data.deskUserUuid,
           deskUserPassword: data.data.deskUserPassword,
-          remoteDeskUserUuid: data.data.remoteDeskUserUuid,
         },
-        key: `${data.data.deskUserUuid}`,
+        key: data.data.deskUserUuid,
         client_ip: getSocketRealIp(socket),
       });
       await redisController.setExVal({
-        prefix: REDIS_PREFIX.deskUserSocketid,
+        prefix: REDIS_PREFIX.deskUserSocketId,
         exp: 10,
         value: {
           socket_id: socket.id,
           deskUserUuid: data.data.deskUserUuid,
-          deskUserPassword: data.data.deskUserPassword,
-          remoteDeskUserUuid: data.data.remoteDeskUserUuid,
         },
         key: socket.id,
         client_ip: getSocketRealIp(socket),
@@ -280,7 +204,6 @@ export async function handleWsMessage(args: {
   data: WsMessageType;
 }) {
   const { io, socket, data } = args;
-  console.log(data);
   let liveRoomId = data.data.live_room_id;
   if (data.data.isBilibili && initUser.systemUserBilibili.live_room.id) {
     liveRoomId = initUser.systemUserBilibili.live_room.id;
@@ -321,11 +244,6 @@ export async function handleWsMessage(args: {
     const data2 = filterObj(data, ['user_token', 'request_id']);
     data2.data.content = content.slice(0, MSG_MAX_LENGTH);
     data2.data.msg_id = msgRes.id;
-    console.log('emi', {
-      roomId: liveRoomId,
-      msgType: WsMsgTypeEnum.message,
-      data: data2,
-    });
     ioEmit<any>({
       io,
       roomId: liveRoomId,
@@ -399,7 +317,7 @@ export async function handleWsDisconnecting(args: {
 }) {
   const { io, socket } = args;
   const val = await redisController.getVal({
-    prefix: REDIS_PREFIX.deskUserSocketid,
+    prefix: REDIS_PREFIX.deskUserSocketId,
     key: socket.id,
   });
   let remoteDeskUserUuid = '';
@@ -417,7 +335,7 @@ export async function handleWsDisconnecting(args: {
         key: remoteDeskUserUuid,
       }),
       redisController.del({
-        prefix: REDIS_PREFIX.deskUserSocketid,
+        prefix: REDIS_PREFIX.deskUserSocketId,
         key: socket.id,
       }),
     ]);
@@ -504,7 +422,7 @@ export async function handleWsStartLive(args: {
   socket: Socket;
   data: WsStartLiveType;
 }) {
-  const { io, socket, data } = args;
+  const { socket, data } = args;
   const userId = data.user_info?.id;
   const {
     roomId,
@@ -525,7 +443,6 @@ export async function handleWsStartLive(args: {
   ) {
     await liveService.create({
       live_room_id: Number(roomId),
-      user_id: userId,
       socket_id: data.socket_id,
       track_audio: 1,
       track_video: 1,
@@ -739,4 +656,181 @@ export async function handleWsDisableSpeaking(args: {
       });
     }
   }
+}
+
+// ======
+
+export async function handleWsBilldDeskJoin(args: {
+  io: Server;
+  socket: Socket;
+  roomId: string;
+  data: WsBilldDeskJoinType;
+}) {
+  const { socket, data } = args;
+  const { roomId } = args;
+  if (!roomId) {
+    console.log(chalkERROR('roomId为空'));
+    return;
+  }
+  socket.join(roomId);
+  console.log(chalkWARN(`${socket.id}进入房间号:${roomId}`));
+  await redisController.setExVal({
+    prefix: REDIS_PREFIX.deskUserUuid,
+    exp: 10,
+    value: {
+      socket_id: socket.id,
+      deskUserUuid: data.data.deskUserUuid,
+      deskUserPassword: data.data.deskUserPassword,
+    },
+    key: data.data.deskUserUuid,
+    client_ip: getSocketRealIp(socket),
+  });
+  await redisController.setExVal({
+    prefix: REDIS_PREFIX.deskUserSocketId,
+    exp: 10,
+    value: {
+      socket_id: socket.id,
+      deskUserUuid: data.data.deskUserUuid,
+    },
+    key: socket.id,
+    client_ip: getSocketRealIp(socket),
+  });
+  socketEmit<WsBilldDeskJoinedType['data']>({
+    socket,
+    msgType: WsMsgTypeEnum.billdDeskJoined,
+    data: {
+      live_room_id: roomId,
+    },
+  });
+}
+
+export async function handleWsBilldDeskStartRemote(args: {
+  io: Server;
+  socket: Socket;
+  data: WsBilldDeskStartRemote;
+}) {
+  const { socket, data } = args;
+  if (!data.data.roomId) {
+    console.log('handleWsBilldDeskStartRemote错误，roomId为空');
+    return;
+  }
+  if (
+    !data.data.deskUserUuid ||
+    !data.data.deskUserPassword ||
+    !data.data.remoteDeskUserUuid ||
+    !data.data.remoteDeskUserPassword
+  ) {
+    console.log(
+      'deskUserUuid或deskUserPassword或remoteDeskUserUuid或remoteDeskUserPassword为空'
+    );
+    socketEmit({
+      socket,
+      msgType: WsMsgTypeEnum.billdDeskStartRemoteResult,
+      data: {
+        code: 1,
+        msg: 'deskUserUuid或deskUserPassword或remoteDeskUserUuid或remoteDeskUserPassword为空',
+        data: filterObj(data.data, ['deskUserPassword']),
+      },
+    });
+    return;
+  }
+  const flag1 = await deskUserController.common.login({
+    uuid: data.data.deskUserUuid,
+    password: data.data.deskUserPassword,
+  });
+  if (!flag1) {
+    console.log('主控密码错误');
+    socketEmit({
+      socket,
+      msgType: WsMsgTypeEnum.billdDeskStartRemoteResult,
+      data: {
+        code: 2,
+        msg: '主控密码错误',
+        data: filterObj(data.data, ['deskUserPassword']),
+      },
+    });
+    return;
+  }
+  const flag2 = await deskUserController.common.login({
+    uuid: data.data.remoteDeskUserUuid,
+    password: data.data.remoteDeskUserPassword,
+  });
+  if (!flag2) {
+    console.log('被控密码错误');
+    socketEmit({
+      socket,
+      msgType: WsMsgTypeEnum.billdDeskStartRemoteResult,
+      data: {
+        code: 3,
+        msg: '被控密码错误',
+        data: filterObj(data.data, ['deskUserPassword']),
+      },
+    });
+    return;
+  }
+  const val = await redisController.getVal({
+    prefix: REDIS_PREFIX.deskUserUuid,
+    key: `${data.data.remoteDeskUserUuid}`,
+  });
+  if (!val) {
+    console.log('remoteDeskUserUuid不在线');
+    socketEmit({
+      socket,
+      msgType: WsMsgTypeEnum.billdDeskStartRemoteResult,
+      data: {
+        code: 4,
+        msg: 'remoteDeskUserUuid不在线',
+        data: filterObj(data.data, ['deskUserPassword']),
+      },
+    });
+    return;
+  }
+  let receiver = '';
+  try {
+    const cache = JSON.parse(val) as IRedisVal<{
+      receiver: string;
+      socket_id: string;
+      deskUserUuid: string;
+      deskUserPassword: string;
+      remoteDeskUserUuid: string;
+    }>;
+    receiver = cache.value.socket_id;
+  } catch (error) {
+    console.log(error);
+  }
+  if (receiver === '') {
+    console.log('获取remoteDeskUserUuid错误');
+    socketEmit({
+      roomId: data.data.roomId,
+      socket,
+      msgType: WsMsgTypeEnum.billdDeskStartRemoteResult,
+      data: {
+        code: 5,
+        msg: '获取remoteDeskUserUuid错误',
+        data: filterObj(data.data, ['deskUserPassword']),
+      },
+    });
+    return;
+  }
+  socketEmit<WsBilldDeskStartRemoteResult['data']>({
+    roomId: data.data.roomId,
+    socket,
+    msgType: WsMsgTypeEnum.billdDeskStartRemoteResult,
+    data: {
+      code: 0,
+      msg: 'ok',
+      // @ts-ignore
+      data: { ...filterObj(data.data, ['deskUserPassword']), receiver },
+    },
+  });
+  socketEmit<WsBilldDeskStartRemoteResult['data']>({
+    socket,
+    msgType: WsMsgTypeEnum.billdDeskStartRemoteResult,
+    data: {
+      code: 0,
+      msg: 'ok',
+      // @ts-ignore
+      data: { ...filterObj(data.data, ['deskUserPassword']), receiver },
+    },
+  });
 }
